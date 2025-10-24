@@ -1,5 +1,6 @@
 #include "manager.hpp"
 #include "utils.hpp"
+#include "db.hpp"
 #include <iostream>
 #include <filesystem>
 #include <curl/curl.h>
@@ -56,6 +57,9 @@ std::string PackageManager::getSpeed() {
 
 // ---------- main ops ----------
 void PackageManager::install(const std::string& pkgName) {
+    Database db;
+    db.load();
+
     std::string name = pkgName;
     std::string version = "latest";
 
@@ -66,6 +70,12 @@ void PackageManager::install(const std::string& pkgName) {
             version = pkgName.substr(i);
             break;
         }
+    }
+
+    if (db.isInstalled(name)) {
+        std::cout << " Package '" << name << "' already installed (version "
+                  << db.getVersion(name) << ")\n";
+        return;
     }
 
     std::cout << "Installing " << name << " version " << version << "...\n";
@@ -100,33 +110,71 @@ void PackageManager::install(const std::string& pkgName) {
     }
 
     std::cout << "\nExtracting package...\n";
-    std::string dest = "/usr/bin/";
+    std::string dest = meta.value("destination", "/usr/bin/");
     extractPackage(downloadDir + archiveBase, dest);
     std::cout << name << " installed successfully!\n";
+
+    db.addPackage(name, version, dest);
+    db.save();
 }
 
 void PackageManager::remove(const std::string& name) {
+    Database db;
+    db.load();
+
+    if (!db.isInstalled(name)) {
+        std::cout << " Package '" << name << "' is not installed.\n";
+        return;
+    }
+
     std::cout << "Removing " << name << "...\n";
     for (int i = 0; i <= 100; i += 20) {
         showProgress(name, i, "Removing");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
+    // remove binaries (based on db)
+    std::string path = db.getDestination(name);
+    if (!path.empty()) {
+        std::string cmd = "rm -f " + path + "/" + name;
+        system(cmd.c_str());
+    }
+
+    db.removePackage(name);
+    db.save();
     std::cout << "\n" << name << " removed.\n";
 }
 
 void PackageManager::sync(const std::string& name) {
+    Database db;
+    db.load();
+
+    if (!db.isInstalled(name)) {
+        std::cout << " Package '" << name << "' not installed.\n";
+        return;
+    }
+
     std::cout << "Checking updates for " << name << "...\n";
     json meta = getJSON(baseURL + name + "/latest.json");
-    std::cout << name << " latest version: " << meta["version"] << "\n";
+    std::string latestVer = meta["version"];
+    std::string currentVer = db.getVersion(name);
+
+    if (latestVer != currentVer) {
+        std::cout << "  Update available: " << currentVer << " → " << latestVer << "\n";
+        remove(name);
+        install(name + latestVer);
+    } else {
+        std::cout << "  " << name << " already up to date.\n";
+    }
 }
 
 void PackageManager::syncAll() {
+    Database db;
+    db.load();
+
     std::cout << "Synchronizing all packages...\n";
-    json index = getJSON(baseURL + "index.json");
-    for (auto& pkg : index["packages"]) {
-        std::string name = pkg["name"];
-        std::cout << "\nUpdating " << name << "...\n";
-        sync(name);
+    for (auto& pkg : db.listInstalled()) {
+        sync(pkg.first);
     }
     std::cout << "\nAll packages synchronized.\n";
 }
