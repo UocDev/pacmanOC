@@ -13,6 +13,7 @@ add_executable(pacmanoc
     src/core/manager.cpp
     src/core/utils.cpp
     src/core/db.cpp
+    src/core/tree.cpp
 )
 
 target_link_libraries(pacmanoc PRIVATE CURL::libcurl)
