@@ -8,6 +8,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <unistd.h> // for geteuid()
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -46,17 +47,33 @@ void PackageManager::showProgress(const std::string& pkg, int percent, const std
     std::cout << "\r" << pkg << " " << state << " [";
     for (int i = 0; i < bars; ++i) std::cout << "#";
     for (int i = bars; i < 10; ++i) std::cout << ".";
-    std::cout << "] " << percent << "%   " << getSpeed() << "   ";
+    std::cout << "] " << percent << "%   ";
     std::flush(std::cout);
 }
 
-std::string PackageManager::getSpeed() {
-    int speed = 500 + rand() % 2000;
-    return std::to_string(speed) + " KB/s";
+// ---------- helper ----------
+static long getRemoteFileSize(const std::string& url) {
+    CURL* curl = curl_easy_init();
+    double cl;
+    if (!curl) return 0;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl);
+    curl_easy_cleanup(curl);
+    return static_cast<long>(cl);
 }
 
 // ---------- main ops ----------
 void PackageManager::install(const std::string& pkgName) {
+    if (geteuid() != 0) {
+        std::cerr << "[WARN] This operation requires root privileges.\n"
+                  << "Please rerun with 'sudo pacmanoc install " << pkgName << "'\n";
+        return;
+    }
+
     Database db;
     db.load();
 
@@ -78,27 +95,45 @@ void PackageManager::install(const std::string& pkgName) {
         return;
     }
 
-    std::cout << "Installing " << name << " version " << version << "...\n";
-
     std::string url = baseURL + name + "/";
     json meta;
 
-    if (version == "latest") {
-        meta = getJSON(url + "latest.json");
-        version = meta["version"];
-        url += version + "/";
-    } else {
-        url += version + "/";
-        meta = getJSON(url + "metadata.json");
+    auto start = std::chrono::steady_clock::now();
+    std::cout << "fetching " << name << " latest version " << url << "latest.json\n";
+    meta = getJSON(url + "latest.json");
+    version = meta["version"];
+    std::cout << "fetching " << name << " metadata " << url << version << "/metadata.json\n";
+
+    json metaData = getJSON(url + version + "/metadata.json");
+    auto end = std::chrono::steady_clock::now();
+    double sec = std::chrono::duration<double>(end - start).count();
+
+    // get file size
+    std::string archiveURL = url + version + "/" + name + ".ocpackage";
+    long sizeBytes = getRemoteFileSize(archiveURL);
+    double sizeMB = sizeBytes / (1024.0 * 1024.0);
+
+    std::cout << "\nfetched " << (sizeBytes / 1024) << "KB in " << sec << "s\n";
+    std::cout << "on Archives " << sizeMB << "MB. after this operation, " 
+              << sizeMB << "MB of additional disk space will be used.\n";
+    std::cout << "Do you want to continue? [Y/n] ";
+
+    char confirm;
+    std::cin >> confirm;
+    if (confirm == 'n' || confirm == 'N') {
+        std::cout << "Aborted.\n";
+        return;
     }
 
-    int parts = meta.value("parts", 1);
+    std::cout << "\nInstalling " << name << " version " << version << "...\n";
+
+    int parts = metaData.value("parts", 1);
     std::string archiveBase = name + ".ocpackage";
     fs::create_directories(downloadDir);
 
     for (int p = 1; p <= parts; ++p) {
         std::string fileName = (p == 1 ? archiveBase : name + "_" + std::to_string(p) + ".ocpackage");
-        std::string fullURL = url + fileName;
+        std::string fullURL = url + version + "/" + fileName;
         std::string outFile = downloadDir + fileName;
 
         std::cout << "Downloading part " << p << "/" << parts << "...\n";
@@ -110,7 +145,7 @@ void PackageManager::install(const std::string& pkgName) {
     }
 
     std::cout << "\nExtracting package...\n";
-    std::string dest = meta.value("destination", "/usr/bin/");
+    std::string dest = metaData.value("destination", "/usr/bin/");
     extractPackage(downloadDir + archiveBase, dest);
     std::cout << name << " installed successfully!\n";
 
@@ -119,11 +154,32 @@ void PackageManager::install(const std::string& pkgName) {
 }
 
 void PackageManager::remove(const std::string& name) {
+    if (geteuid() != 0) {
+        std::cerr << "[WARN] This operation requires root privileges.\n"
+                  << "Please rerun with 'sudo pacmanoc remove " << name << "'\n";
+        return;
+    }
+
     Database db;
     db.load();
 
     if (!db.isInstalled(name)) {
         std::cout << " Package '" << name << "' is not installed.\n";
+        return;
+    }
+
+    std::string path = db.getDestination(name) + "/" + name;
+    double sizeMB = 0;
+    if (fs::exists(path))
+        sizeMB = fs::file_size(path) / (1024.0 * 1024.0);
+
+    std::cout << "After this operation, " << sizeMB << "MB disk space will be freed.\n";
+    std::cout << "Do you want to continue? [Y/n] ";
+
+    char confirm;
+    std::cin >> confirm;
+    if (confirm == 'n' || confirm == 'N') {
+        std::cout << "Aborted.\n";
         return;
     }
 
@@ -133,15 +189,10 @@ void PackageManager::remove(const std::string& name) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // remove binaries (based on db)
-    std::string path = db.getDestination(name);
-    if (!path.empty()) {
-        std::string cmd = "rm -f " + path + "/" + name;
-        system(cmd.c_str());
-    }
-
+    if (fs::exists(path)) fs::remove(path);
     db.removePackage(name);
     db.save();
+
     std::cout << "\n" << name << " removed.\n";
 }
 
