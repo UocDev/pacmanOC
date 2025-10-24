@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <unistd.h> // for geteuid()
+#include <iomanip>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -54,16 +55,37 @@ void PackageManager::showProgress(const std::string& pkg, int percent, const std
 // ---------- helper ----------
 static long getRemoteFileSize(const std::string& url) {
     CURL* curl = curl_easy_init();
-    double cl;
+    curl_off_t cl = 0;
     if (!curl) return 0;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl);
+    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
     curl_easy_cleanup(curl);
     return static_cast<long>(cl);
+}
+
+static std::string humanSize(double bytes) {
+    const char* units[] = {"B", "KB", "MB", "GB"};
+    int i = 0;
+    while (bytes >= 1024 && i < 3) {
+        bytes /= 1024;
+        ++i;
+    }
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2) << bytes << " " << units[i];
+    return ss.str();
+}
+
+static bool confirmAction(const std::string& msg) {
+    std::cout << msg << " [Y/n] ";
+    std::string input;
+    std::getline(std::cin, input);
+    if (input.empty() || input == "Y" || input == "y")
+        return true;
+    return false;
 }
 
 // ---------- main ops ----------
@@ -96,38 +118,32 @@ void PackageManager::install(const std::string& pkgName) {
     }
 
     std::string url = baseURL + name + "/";
-    json meta;
-
     auto start = std::chrono::steady_clock::now();
     std::cout << "fetching " << name << " latest version " << url << "latest.json\n";
-    meta = getJSON(url + "latest.json");
-    version = meta["version"];
+    json latest = getJSON(url + "latest.json");
+    version = latest["version"];
     std::cout << "fetching " << name << " metadata " << url << version << "/metadata.json\n";
-
-    json metaData = getJSON(url + version + "/metadata.json");
+    json meta = getJSON(url + version + "/metadata.json");
     auto end = std::chrono::steady_clock::now();
     double sec = std::chrono::duration<double>(end - start).count();
 
     // get file size
     std::string archiveURL = url + version + "/" + name + ".ocpackage";
     long sizeBytes = getRemoteFileSize(archiveURL);
-    double sizeMB = sizeBytes / (1024.0 * 1024.0);
 
-    std::cout << "\nfetched " << (sizeBytes / 1024) << "KB in " << sec << "s\n";
-    std::cout << "on Archives " << sizeMB << "MB. after this operation, " 
-              << sizeMB << "MB of additional disk space will be used.\n";
-    std::cout << "Do you want to continue? [Y/n] ";
+    std::cout << "\nfetched " << humanSize(sizeBytes) << " in " << sec << "s\n";
+    std::cout << "on Archives " << humanSize(sizeBytes)
+              << ". after this operation, " << humanSize(sizeBytes)
+              << " of additional disk space will be used.\n";
 
-    char confirm;
-    std::cin >> confirm;
-    if (confirm == 'n' || confirm == 'N') {
+    if (!confirmAction("Do you want to continue?")) {
         std::cout << "Aborted.\n";
         return;
     }
 
     std::cout << "\nInstalling " << name << " version " << version << "...\n";
 
-    int parts = metaData.value("parts", 1);
+    int parts = meta.value("parts", 1);
     std::string archiveBase = name + ".ocpackage";
     fs::create_directories(downloadDir);
 
@@ -145,7 +161,7 @@ void PackageManager::install(const std::string& pkgName) {
     }
 
     std::cout << "\nExtracting package...\n";
-    std::string dest = metaData.value("destination", "/usr/bin/");
+    std::string dest = meta.value("destination", "/usr/bin/");
     extractPackage(downloadDir + archiveBase, dest);
     std::cout << name << " installed successfully!\n";
 
@@ -169,16 +185,14 @@ void PackageManager::remove(const std::string& name) {
     }
 
     std::string path = db.getDestination(name) + "/" + name;
-    double sizeMB = 0;
+    double sizeBytes = 0;
     if (fs::exists(path))
-        sizeMB = fs::file_size(path) / (1024.0 * 1024.0);
+        sizeBytes = fs::file_size(path);
 
-    std::cout << "After this operation, " << sizeMB << "MB disk space will be freed.\n";
-    std::cout << "Do you want to continue? [Y/n] ";
+    std::cout << "After this operation, " << humanSize(sizeBytes)
+              << " of disk space will be freed.\n";
 
-    char confirm;
-    std::cin >> confirm;
-    if (confirm == 'n' || confirm == 'N') {
+    if (!confirmAction("Do you want to continue?")) {
         std::cout << "Aborted.\n";
         return;
     }
