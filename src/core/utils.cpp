@@ -1,4 +1,5 @@
 #include "utils.hpp"
+#include "manager.hpp"
 #include <cstdlib>
 
 void PackageManager::extractPackage(const std::string& file, const std::string& dest) {
